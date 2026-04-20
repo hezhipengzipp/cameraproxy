@@ -1,0 +1,387 @@
+@startuml CameraProxy-Architecture
+' ==========================================================================
+'  CameraProxy 整体架构图
+' --------------------------------------------------------------------------
+'  展示三大模块、两大进程、核心组件及其依赖关系
+' ==========================================================================
+
+title CameraProxy — 跨进程相机共享框架 · 整体架构
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam defaultFontName "PingFang SC"
+skinparam backgroundColor #FDFDFD
+
+skinparam component {
+  BackgroundColor #E8F4FD
+  BorderColor     #3B82F6
+  FontColor       #111827
+}
+skinparam package {
+  BackgroundColor #F9FAFB
+  BorderColor     #9CA3AF
+  FontColor       #111827
+}
+skinparam interface {
+  BackgroundColor #FEF3C7
+  BorderColor     #D97706
+}
+
+' ---------- AIDL 共享契约 ----------
+package "aidl (共享库)" as AIDL #FFF7ED {
+  interface ICameraProxyService <<AIDL>>
+  interface ICameraCallback     <<AIDL>>
+  component CameraCapabilities  <<Parcelable>>
+}
+
+' ---------- Client 进程 ----------
+package "Client 进程\ncom.example.cameraproxy.client" as CLIENT_PROC #ECFDF5 {
+  component "MainActivity\n(SurfaceView 容器)" as ClientActivity
+  component "ICameraCallback.Stub\n(回调实现)"    as ClientCallback
+  component "SurfaceView\n.holder.surface"       as ClientSurface
+}
+
+' ---------- Server 进程 :camera ----------
+package "Server 进程 :camera\ncom.example.cameraproxy.server" as SERVER_PROC #EFF6FF {
+
+  component "MainActivity\n(启动面板 + 权限申请)" as ServerActivity
+
+  package "CameraHolderService\n(前台服务, foregroundServiceType=camera)" as SERVICE #DBEAFE {
+    component "ICameraProxyService.Stub\n(Binder 入口)"          as BinderStub
+    component "SubscriberRecord Map\n(id → callback + deathRecipient)" as Records
+    component "controlOwner\n(AtomicReference<Int?>)"            as CtrlOwner
+  }
+
+  package "CameraEngine\n(相机 + GL 核心)" as ENGINE #DBEAFE {
+    component "Camera Thread\n(HandlerThread)"     as CamThread
+    component "CameraDevice"                       as CamDevice
+    component "CameraCaptureSession"               as CapSession
+    component "GL Thread\n(HandlerThread)"          as GlThread
+    component "SurfaceTexture\n(OES 消费端)"        as STex
+    component "OES Texture ID"                      as OesTex
+  }
+
+  package "gl/ (OpenGL ES 2.0 封装)" as GL #DBEAFE {
+    component "EglCore\n(EGLDisplay / Context / Surface)" as EglCore
+    component "OesTextureProgram\n(Shader + 全屏四边形)"   as Program
+  }
+}
+
+' ---------- 关系 ----------
+
+' Client 侧组合
+ClientActivity --> ClientCallback : 创建并传给 Server
+ClientActivity --> ClientSurface  : 提供显示容器
+ClientActivity --> ServerActivity : (同设备不同 App, 无直接调用)
+
+' Client → Server 跨进程 AIDL 调用
+ClientActivity ..> ICameraProxyService : bindService\nsubscribe / openCamera
+ICameraProxyService .right.> BinderStub
+BinderStub ..> ICameraCallback : 反向 Binder\nonFrameStart / onError
+ICameraCallback ..> ClientCallback
+
+' Server 内部编排
+ServerActivity --> SERVICE : startForegroundService
+BinderStub --> Records : 增删订阅档案
+BinderStub --> CtrlOwner : CAS 互斥控制权
+BinderStub --> ENGINE  : addSubscriber / removeSubscriber
+
+' 相机 + GL 数据流
+CamDevice --> CapSession
+CapSession --> STex : 每帧写入\n(GraphicBuffer)
+STex --> OesTex : updateTexImage()\n绑定 OES 纹理
+OesTex --> Program : 采样\n(samplerExternalOES)
+Program --> EglCore : glDraw + swapBuffers
+
+' GL 输出 → 回到 Client
+EglCore ..> ClientSurface : eglSwapBuffers\n(跨进程, 零拷贝)
+
+' 线程归属
+CamThread -[hidden]-> CamDevice
+GlThread  -[hidden]-> STex
+GlThread  -[hidden]-> Program
+
+' 说明
+note right of ENGINE
+  **Fan-out 核心**:
+  一个 OES 纹理 →
+  for each subscriber:
+    makeCurrent(EGLSurface_i)
+    draw(oesTex, stMatrix)
+    swapBuffers(EGLSurface_i)
+end note
+
+note bottom of SERVICE
+  **订阅管理**:
+  • subscribe → 生成 ID + linkToDeath
+  • Client 崩溃 → 自动 unsubscribe
+  • 最后一个订阅者退出 → closeCamera
+end note
+
+@enduml
+
+
+@startuml CameraProxy-Subscribe-Sequence
+' ==========================================================================
+'  订阅流程时序图 —— Client bindService 到首帧上屏
+' ==========================================================================
+
+title 订阅流程时序图 · bindService → subscribe → 首帧
+
+skinparam shadowing false
+skinparam defaultFontName "PingFang SC"
+skinparam backgroundColor #FDFDFD
+skinparam sequenceMessageAlign center
+
+actor "用户" as User
+participant "Client\nMainActivity" as Client
+participant "Server\nCameraHolder\nService (Binder)" as Service
+participant "Camera\nEngine" as Engine
+participant "GL Thread\n(glHandler)" as Gl
+participant "Camera2\nCameraDevice" as Cam2
+
+== 1. 启动 & 绑定 ==
+User -> Client : 打开 App
+activate Client
+Client -> Service : bindService(ACTION_BIND)
+activate Service
+Service --> Client : onServiceConnected(IBinder)
+Client -> Client : proxy = Stub.asInterface()
+
+== 2. Surface 就绪 ==
+Client -> Client : surfaceCreated(holder)
+note right: SurfaceView 创建完成
+
+== 3. 打开相机（幂等） ==
+Client -> Service : openCamera("0", 1280, 720, PRIVATE)
+Service -> Engine : openCamera(..)
+activate Engine
+Engine -> Gl : runOnGlThreadBlocking {\n  EglCore + OES Tex\n  + SurfaceTexture\n}
+activate Gl
+Gl --> Engine : GL 就绪
+deactivate Gl
+Engine -> Cam2 : manager.openCamera(..)
+activate Cam2
+Cam2 --> Engine : onOpened(device)
+Engine -> Cam2 : createCaptureSession([cameraInputSurface])
+Cam2 --> Engine : onConfigured(session)
+Engine -> Cam2 : setRepeatingRequest(TEMPLATE_PREVIEW)
+deactivate Cam2
+Engine --> Service : true
+deactivate Engine
+Service --> Client : true
+
+== 4. 订阅 ==
+Client -> Service : subscribe(surface, callback)
+activate Service
+Service -> Engine : addSubscriber(surface)
+activate Engine
+Engine -> Gl : createWindowSurface(surface)
+activate Gl
+Gl --> Engine : EGLSurface
+deactivate Gl
+Engine --> Service : engineId=1
+deactivate Engine
+Service -> Service : callback.asBinder()\n  .linkToDeath(..)
+Service -> Service : records[1] = SubscriberRecord
+Service --> Client : subscriberId=1
+deactivate Service
+
+== 5. 首帧渲染（异步循环） ==
+Cam2 -> Gl : onFrameAvailable\n(SurfaceTexture)
+activate Gl
+Gl -> Gl : makeCurrent(dummy)\nupdateTexImage\ngetTransformMatrix
+loop 对每个订阅者
+  Gl -> Gl : makeCurrent(eglSurface_i)
+  Gl -> Gl : glViewport + glClear
+  Gl -> Gl : program.draw(oesTex, stMatrix)
+  Gl -> Client : eglSwapBuffers\n(跨进程 Surface)
+end
+Gl -> Service : listener.onFirstFrame()
+Service -> Client : callback.onFrameStart()
+deactivate Gl
+Client -> User : 预览显示首帧
+deactivate Client
+
+@enduml
+
+
+@startuml CameraProxy-Unsubscribe-Sequence
+' ==========================================================================
+'  反注册时序图 —— 两条路径：主动 unsubscribe vs. 进程死亡
+' ==========================================================================
+
+title 反注册时序图 · 主动退订 vs. 客户端崩溃
+
+skinparam shadowing false
+skinparam defaultFontName "PingFang SC"
+skinparam backgroundColor #FDFDFD
+
+participant "Client" as Client
+participant "Service\n(Binder)" as Service
+participant "Engine" as Engine
+participant "GL Thread" as Gl
+
+== 路径 A：Client 主动退订（onStop） ==
+Client -> Service : unsubscribe(id=1)
+Service -> Service : records.remove(1)
+Service -> Service : unlinkToDeath
+Service -> Engine : removeSubscriber(1)
+activate Engine
+Engine -> Engine : binding.valid = false
+Engine -> Gl : releaseSurface(eglSurface)
+deactivate Engine
+Service -> Service : controlOwner.CAS(1, null)
+alt 无订阅者
+  Service -> Engine : closeCamera()
+  Engine -> Gl : 释放 GL / 停线程
+end
+
+== 路径 B：Client 进程崩溃 ==
+note over Client : Client 进程被杀 / 崩溃
+Service -> Service : deathRecipient.binderDied()\n(Binder 线程触发)
+Service -> Service : internalUnsubscribe(1)\n(走上面同一套清理)
+note right of Service
+  linkToDeath 是保障：
+  即使 Client 没机会调
+  unsubscribe 也不会泄漏
+end note
+
+@enduml
+
+
+@startuml CameraProxy-Frame-Fanout
+' ==========================================================================
+'  帧分发数据流 —— 一路采集如何变成多路输出
+' ==========================================================================
+
+title 帧分发数据流 · GL Fan-out (零拷贝)
+
+skinparam shadowing false
+skinparam defaultFontName "PingFang SC"
+skinparam backgroundColor #FDFDFD
+skinparam componentStyle rectangle
+
+skinparam component {
+  BackgroundColor #E8F4FD
+  BorderColor     #3B82F6
+}
+skinparam queue {
+  BackgroundColor #FEF3C7
+  BorderColor     #D97706
+}
+
+component "Camera HAL\n(硬件传感器)" as HAL
+
+queue "GraphicBuffer\n(BufferQueue)" as GB
+
+component "SurfaceTexture\n(OES 消费端)" as ST
+component "OES Texture ID\n(GL_TEXTURE_EXTERNAL_OES)" as OES
+
+component "OesTextureProgram\n(Shader 程序)" as PROG
+
+component "EGLSurface #1\n(订阅者 A)" as S1
+component "EGLSurface #2\n(订阅者 B)" as S2
+component "EGLSurface #3\n(订阅者 C)" as S3
+
+component "Client A\nSurfaceView" as CA
+component "Client B\nSurfaceView" as CB
+component "Client C\nSurfaceView" as CC
+
+HAL --> GB : 写入 YUV/PRIVATE\n(硬件 DMA)
+GB --> ST : 出队一帧
+ST --> OES : updateTexImage()\n绑定到当前纹理
+OES --> PROG : samplerExternalOES 采样
+
+PROG --> S1 : makeCurrent\ndraw + swap
+PROG --> S2 : makeCurrent\ndraw + swap
+PROG --> S3 : makeCurrent\ndraw + swap
+
+S1 ..> CA : 跨进程 Surface
+S2 ..> CB : 跨进程 Surface
+S3 ..> CC : 跨进程 Surface
+
+note bottom of OES
+  **同一个 OES 纹理被 N 次采样**
+  GraphicBuffer 内存只驻留一份
+  GL 驱动内部直接把 YUV
+  硬件转换为 RGBA 送显
+end note
+
+note right of PROG
+  单线程顺序执行:
+  for each subscriber:
+    1. makeCurrent(EGLSurface_i)
+    2. glViewport
+    3. drawQuad(oesTex)
+    4. eglSwapBuffers
+  不重建 CaptureSession
+  不重建 GL Context
+  不经过 CPU 内存拷贝
+end note
+
+@enduml
+
+
+@startuml CameraProxy-Thread-Model
+' ==========================================================================
+'  线程模型 —— 谁在哪条线程上做什么
+' ==========================================================================
+
+title 线程模型 · 各组件归属线程
+
+skinparam shadowing false
+skinparam defaultFontName "PingFang SC"
+skinparam backgroundColor #FDFDFD
+
+skinparam rectangle {
+  BackgroundColor<<main>>    #FEE2E2
+  BorderColor<<main>>        #DC2626
+  BackgroundColor<<binder>>  #FEF3C7
+  BorderColor<<binder>>      #D97706
+  BackgroundColor<<camera>>  #DBEAFE
+  BorderColor<<camera>>      #3B82F6
+  BackgroundColor<<gl>>      #DCFCE7
+  BorderColor<<gl>>          #16A34A
+}
+
+rectangle "主线程 (Main)" <<main>> {
+  usecase "Activity 生命周期\nonStart / onStop" as L1
+  usecase "UI 更新\nTextView.setText" as L2
+  usecase "bindService / SurfaceView 回调" as L3
+}
+
+rectangle "Binder 线程池" <<binder>> {
+  usecase "AIDL 方法实现\nsubscribe / unsubscribe\nopenCamera" as L4
+  usecase "ICameraCallback 反向调用\nonFrameStart" as L5
+  usecase "DeathRecipient 触发\nbinderDied" as L6
+}
+
+rectangle "camera-proxy-cam 线程" <<camera>> {
+  usecase "CameraDevice.StateCallback\nonOpened / onError" as L7
+  usecase "CaptureSession.StateCallback\nonConfigured" as L8
+  usecase "setRepeatingRequest 回调" as L9
+}
+
+rectangle "camera-proxy-gl 线程" <<gl>> {
+  usecase "EglCore 初始化\nmakeCurrent / swapBuffers" as L10
+  usecase "SurfaceTexture.updateTexImage\ndrawFrame fan-out" as L11
+  usecase "EGLSurface 创建 / 释放" as L12
+}
+
+L3 -down-> L4 : bindService\n后续 AIDL 调用
+L4 -down-> L7 : Camera2 API 异步回调
+L4 -right-> L10 : runOnGlThreadBlocking
+L9 -down-> L11 : onFrameAvailable\n(SurfaceTexture 安排到 GL)
+L11 -up-> L5 : listener.onFirstFrame\n(经 Service 转发)
+L5 -up-> L2 : Handler.post 切回主线程
+
+note bottom
+  **关键纪律**:
+  • GL 调用只在 GL 线程（context 绑定线程）
+  • Camera2 回调只在 camera 线程
+  • AIDL Binder 方法切 GL 线程前必须用 Handler.post 同步（runOnGlThreadBlocking）
+  • Client 回调必须 Handler.post 回主线程才能动 UI
+end note
+
+@enduml
