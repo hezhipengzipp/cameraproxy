@@ -55,9 +55,23 @@ class CameraHolderService : Service() {
     private val records = ConcurrentHashMap<Int, SubscriberRecord>()
 
     /**
-     * 当前独占控制权持有者的 ID（null 表示无人持有）。
-     * 用 AtomicReference 是为了用 compareAndSet 做原子互斥 —— 多个 Client
-     * 同时 requestControl 时只有一个能成功。
+     * 【脚手架字段 —— 当前未真正发挥作用】
+     *
+     * 本意：当多个 Client 想修改相机参数（曝光 / 对焦 / 闪光灯 / 白平衡等）时，
+     *       用它做**互斥锁**，保证同一时刻只有一个 Client 在改参数，避免相互覆盖。
+     *
+     * 现状：唯一消费它的方法 setExposure 本身还是 TODO 占位（只打日志，没真正
+     *       下发到 CameraEngine），所以这个字段目前**空守一个空方法**。
+     *
+     * 工作原理：用 compareAndSet 做原子互斥 ——
+     *   - requestControl(id)  ：CAS(null → id)，只有当前无人持有时才成功抢到；
+     *   - releaseControl(id)  ：CAS(id → null)，只有自己持有时才能释放；
+     *   - 订阅者断开时           ：在 internalUnsubscribe 里顺手 CAS(id → null) 清理。
+     *
+     * TODO: 等 CameraEngine 补上 setExposure(value) → 重发 RepeatingRequest
+     *       （CONTROL_AE_EXPOSURE_COMPENSATION）后，这个字段就名副其实了。
+     *       如果长期不打算做参数控制，可以连同 AIDL 里的 requestControl /
+     *       setExposure / releaseControl 一起删掉。
      */
     private val controlOwner = AtomicReference<Int?>(null)
 
