@@ -3,6 +3,7 @@ package com.example.cameraproxy.client
 import android.content.ComponentName
 import android.content.Intent
 import android.content.ServiceConnection
+import android.widget.Button
 import android.graphics.ImageFormat
 import android.os.Bundle
 import android.os.Handler
@@ -87,6 +88,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_client)
         status = findViewById(R.id.status)
+        findViewById<Button>(R.id.btn_go_dvr).setOnClickListener {
+            startActivity(Intent(this, DvrActivity::class.java))
+        }
         // 注册 SurfaceView 的生命周期回调 —— 必须在 SurfaceView 创建后才能拿到 Surface
         findViewById<SurfaceView>(R.id.preview).holder.addCallback(this)
     }

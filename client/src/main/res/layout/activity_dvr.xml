@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000">
+
+    <!-- 实时预览，全屏铺底 -->
+    <SurfaceView
+        android:id="@+id/preview"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <!-- 顶部：状态文字 + 录制计时 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:padding="16dp"
+        android:background="#55000000"
+        android:gravity="center_vertical">
+
+        <TextView
+            android:id="@+id/status"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="idle"
+            android:textColor="#FFF"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/timer"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="00:00"
+            android:textColor="#FF4444"
+            android:textSize="18sp"
+            android:fontFamily="monospace"
+            android:visibility="invisible" />
+
+    </LinearLayout>
+
+    <!-- 底部：录制按钮 -->
+    <Button
+        android:id="@+id/btn_record"
+        android:layout_width="140dp"
+        android:layout_height="48dp"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginBottom="40dp"
+        android:enabled="false"
+        android:text="开始录制" />
+
+</FrameLayout>
