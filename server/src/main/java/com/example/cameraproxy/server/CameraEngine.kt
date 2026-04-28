@@ -19,6 +19,7 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import android.util.Size
 import android.view.Surface
+import android.view.WindowManager
 import com.example.cameraproxy.server.gl.EglCore
 import com.example.cameraproxy.server.gl.OesTextureProgram
 import java.io.IOException
@@ -110,6 +111,8 @@ class CameraEngine(private val appContext: Context, private val listener: Listen
     @Volatile private var currentCameraId: String? = null
     @Volatile private var opened = false
     @Volatile private var firstFrameReported = false
+    @Volatile private var cameraSensorOrientation = 0
+    @Volatile private var cameraLensFacing = CameraCharacteristics.LENS_FACING_BACK
 
     /**
      * 订阅者表：id -> GL 绑定信息。
@@ -412,6 +415,7 @@ class CameraEngine(private val appContext: Context, private val listener: Listen
                     set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
                     set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                     set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                    set(CaptureRequest.JPEG_ORIENTATION, calculateJpegOrientation())
                 }
                 session.capture(capture.build(), object : CaptureCallback() {
                     override fun onCaptureFailed(
@@ -539,6 +543,7 @@ class CameraEngine(private val appContext: Context, private val listener: Listen
         var success = false
 
         try {
+            updateCameraOrientationMetadata(manager, cameraId)
             val jpegSize = selectJpegSize(manager, cameraId, currentWidth, currentHeight)
             if (jpegSize == null) {
                 listener.onEngineError(ERR_CONFIG_FAILED, "no supported JPEG output size")
@@ -612,6 +617,45 @@ class CameraEngine(private val appContext: Context, private val listener: Listen
         // 超时兜底：3 秒还没配置成功就认为失败
         latch.await(3, java.util.concurrent.TimeUnit.SECONDS)
         return success
+    }
+
+    private fun updateCameraOrientationMetadata(manager: CameraManager, cameraId: String) {
+        try {
+            val chars = manager.getCameraCharacteristics(cameraId)
+            cameraSensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+            cameraLensFacing = chars.get(CameraCharacteristics.LENS_FACING)
+                ?: CameraCharacteristics.LENS_FACING_BACK
+        } catch (t: Throwable) {
+            cameraSensorOrientation = 0
+            cameraLensFacing = CameraCharacteristics.LENS_FACING_BACK
+            Log.w(TAG, "read camera orientation metadata failed; using defaults", t)
+        }
+    }
+
+    private fun calculateJpegOrientation(): Int {
+        val deviceRotation = currentDisplayRotationDegrees()
+        return if (cameraLensFacing == CameraCharacteristics.LENS_FACING_FRONT) {
+            (cameraSensorOrientation + deviceRotation) % 360
+        } else {
+            (cameraSensorOrientation - deviceRotation + 360) % 360
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun currentDisplayRotationDegrees(): Int {
+        val rotation = try {
+            val windowManager = appContext.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+            windowManager?.defaultDisplay?.rotation ?: Surface.ROTATION_0
+        } catch (t: Throwable) {
+            Log.w(TAG, "read display rotation failed; using ROTATION_0", t)
+            Surface.ROTATION_0
+        }
+        return when (rotation) {
+            Surface.ROTATION_90 -> 90
+            Surface.ROTATION_180 -> 180
+            Surface.ROTATION_270 -> 270
+            else -> 0
+        }
     }
 
     // endregion
