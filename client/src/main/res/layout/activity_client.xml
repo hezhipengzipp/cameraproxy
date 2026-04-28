@@ -19,6 +19,14 @@
         android:layout_marginTop="8dp"
         android:text="DVR 录制" />
 
+    <Button
+        android:id="@+id/btn_capture_photo"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:enabled="false"
+        android:text="拍照" />
+
     <SurfaceView
         android:id="@+id/preview"
         android:layout_marginTop="12dp"

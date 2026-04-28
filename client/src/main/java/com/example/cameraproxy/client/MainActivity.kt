@@ -1,21 +1,34 @@
 package com.example.cameraproxy.client
 
 import android.content.ComponentName
+import android.content.ContentValues
 import android.content.Intent
 import android.content.ServiceConnection
-import android.widget.Button
 import android.graphics.ImageFormat
+import android.media.MediaScannerConnection
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.ParcelFileDescriptor
+import android.provider.MediaStore
 import android.util.Log
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.widget.Button
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import com.example.cameraproxy.ICameraCallback
 import com.example.cameraproxy.ICameraProxyService
+import com.example.cameraproxy.IPhotoCaptureCallback
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * 订阅方的演示 Activity。
@@ -49,6 +62,20 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private val ui = Handler(Looper.getMainLooper())
 
     private lateinit var status: TextView
+    private lateinit var captureButton: Button
+
+    private val pendingPhotos = ConcurrentHashMap<Long, PendingPhoto>()
+    private val earlyPhotoResults = ConcurrentHashMap<Long, PhotoResult>()
+
+    private data class PendingPhoto(
+        val displayName: String,
+        val uri: Uri?,
+        val file: File?
+    )
+
+    private data class PhotoOutput(val photo: PendingPhoto, val pfd: ParcelFileDescriptor)
+
+    private data class PhotoResult(val success: Boolean, val msg: String?)
 
     /**
      * Service 连接监听器。
@@ -84,10 +111,22 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         }
     }
 
+    private val photoCallback = object : IPhotoCaptureCallback.Stub() {
+        override fun onPhotoCaptureSucceeded(requestId: Long) {
+            handlePhotoResult(requestId, PhotoResult(success = true, msg = null))
+        }
+
+        override fun onPhotoCaptureFailed(requestId: Long, msg: String?) {
+            handlePhotoResult(requestId, PhotoResult(success = false, msg = msg))
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_client)
         status = findViewById(R.id.status)
+        captureButton = findViewById(R.id.btn_capture_photo)
+        captureButton.setOnClickListener { capturePhoto() }
         findViewById<Button>(R.id.btn_go_dvr).setOnClickListener {
             startActivity(Intent(this, DvrActivity::class.java))
         }
@@ -159,10 +198,116 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
             }
             subscriberId = p.subscribe(holder.surface, callback)
             setStatus(if (subscriberId > 0) "subscribed id=$subscriberId" else "subscribe failed")
+            ui.post { captureButton.isEnabled = subscriberId > 0 }
         } catch (t: Throwable) {
             Log.e(TAG, "subscribe failed", t)
             setStatus("subscribe exception: ${t.message}")
         }
+    }
+
+    private fun capturePhoto() {
+        val p = proxy ?: run { setStatus("proxy not connected"); return }
+        val id = subscriberId
+        if (id <= 0) {
+            setStatus("not subscribed")
+            return
+        }
+
+        val name = "PHOTO_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.jpg"
+        val output = createPhotoOutput(name) ?: return
+        try {
+            val requestId = p.capturePhoto(id, output.pfd, photoCallback)
+            try { output.pfd.close() } catch (_: Throwable) {}
+            if (requestId <= 0L) {
+                cleanupFailedPhoto(output.photo)
+                setStatus("photo request rejected")
+                return
+            }
+            pendingPhotos[requestId] = output.photo
+            val earlyResult = earlyPhotoResults.remove(requestId)
+            if (earlyResult != null) {
+                handlePhotoResult(requestId, earlyResult)
+            } else {
+                setStatus("photo requested #$requestId")
+            }
+        } catch (t: Throwable) {
+            try { output.pfd.close() } catch (_: Throwable) {}
+            cleanupFailedPhoto(output.photo)
+            Log.e(TAG, "capturePhoto failed", t)
+            setStatus("photo exception: ${t.message}")
+        }
+    }
+
+    private fun handlePhotoResult(requestId: Long, result: PhotoResult) {
+        val photo = pendingPhotos.remove(requestId)
+        if (photo == null) {
+            earlyPhotoResults[requestId] = result
+            return
+        }
+        if (result.success) {
+            publishPhoto(photo)
+            setStatus("photo saved: ${photo.displayName}")
+        } else {
+            cleanupFailedPhoto(photo)
+            setStatus("photo failed $requestId: ${result.msg}")
+        }
+    }
+
+    private fun createPhotoOutput(name: String): PhotoOutput? {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, name)
+                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES)
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                ?: run { setStatus("MediaStore insert failed"); return null }
+            val pfd = contentResolver.openFileDescriptor(uri, "w")
+                ?: run {
+                    contentResolver.delete(uri, null, null)
+                    setStatus("open photo fd failed")
+                    return null
+                }
+            PhotoOutput(PendingPhoto(name, uri, null), pfd)
+        } else {
+            val dir = getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+                ?: run { setStatus("pictures dir unavailable"); return null }
+            dir.mkdirs()
+            val file = File(dir, name)
+            val pfd = ParcelFileDescriptor.open(
+                file,
+                ParcelFileDescriptor.MODE_CREATE or
+                    ParcelFileDescriptor.MODE_TRUNCATE or
+                    ParcelFileDescriptor.MODE_WRITE_ONLY
+            )
+            PhotoOutput(PendingPhoto(name, null, file), pfd)
+        }
+    }
+
+    private fun publishPhoto(photo: PendingPhoto) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            photo.uri?.let { uri ->
+                val values = ContentValues().apply {
+                    put(MediaStore.Images.Media.IS_PENDING, 0)
+                }
+                contentResolver.update(uri, values, null, null)
+            }
+        } else {
+            photo.file?.let { file ->
+                MediaScannerConnection.scanFile(
+                    applicationContext,
+                    arrayOf(file.absolutePath),
+                    arrayOf("image/jpeg"),
+                    null
+                )
+            }
+        }
+    }
+
+    private fun cleanupFailedPhoto(photo: PendingPhoto) {
+        photo.uri?.let { uri -> runCatching { contentResolver.delete(uri, null, null) } }
+        photo.file?.let { file -> runCatching { file.delete() } }
     }
 
     /**
@@ -174,6 +319,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         val p = proxy
         val id = subscriberId
         subscriberId = -1
+        ui.post { captureButton.isEnabled = false }
         if (p != null && id > 0) {
             try { p.unsubscribe(id) } catch (_: Throwable) {}
         }

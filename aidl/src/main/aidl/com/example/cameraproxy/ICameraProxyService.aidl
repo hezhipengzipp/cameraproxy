@@ -1,8 +1,10 @@
 package com.example.cameraproxy;
 
+import android.os.ParcelFileDescriptor;
 import android.view.Surface;
 import com.example.cameraproxy.ICameraCallback;
 import com.example.cameraproxy.CameraCapabilities;
+import com.example.cameraproxy.IPhotoCaptureCallback;
 
 /**
  * Client -> Server 的主接口，用于控制共享相机。
@@ -48,6 +50,18 @@ interface ICameraProxyService {
      * - 当最后一个订阅者退出时，相机自动关闭。
      */
     void unsubscribe(int subscriberId);
+
+    /**
+     * Request one still JPEG capture for an active subscriber.
+     *
+     * The client owns the destination and passes a writable file descriptor.
+     * The service writes JPEG bytes to its duplicated descriptor and closes it
+     * on every success/failure path. Large image data is intentionally not sent
+     * through Binder.
+     *
+     * @return positive request ID when accepted; -1 when rejected before Camera2 work starts.
+     */
+    long capturePhoto(int subscriberId, in ParcelFileDescriptor output, IPhotoCaptureCallback callback);
 
     /**
      * 查询指定相机的能力（分辨率列表、朝向、方向等）。

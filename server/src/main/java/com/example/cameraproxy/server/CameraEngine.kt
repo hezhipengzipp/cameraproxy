@@ -1,21 +1,32 @@
 package com.example.cameraproxy.server
 
 import android.content.Context
+import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CameraCaptureSession.CaptureCallback
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureFailure
+import android.hardware.camera2.CaptureRequest
+import android.media.ImageReader
 import android.opengl.EGLSurface
 import android.opengl.GLES20
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.ParcelFileDescriptor
 import android.util.Log
+import android.util.Size
 import android.view.Surface
 import com.example.cameraproxy.server.gl.EglCore
 import com.example.cameraproxy.server.gl.OesTextureProgram
+import java.io.IOException
+import java.util.ArrayDeque
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.abs
 
 /**
  * 相机的唯一持有者（Single Source of Truth）。
@@ -55,11 +66,23 @@ class CameraEngine(private val appContext: Context, private val listener: Listen
         fun onResolutionChanged(w: Int, h: Int)
     }
 
+    /** Per-request still photo result bridge back to CameraHolderService. */
+    interface PhotoCaptureCallback {
+        fun onPhotoCaptureSucceeded(requestId: Long)
+        fun onPhotoCaptureFailed(requestId: Long, msg: String)
+    }
+
     // --- 只在 cameraThread 上访问的状态 ---
     private var cameraThread: HandlerThread? = null
     private var cameraHandler: Handler? = null
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
+    private var jpegImageReader: ImageReader? = null
+    private var jpegSurface: Surface? = null
+
+    // --- 只在 photoWriterThread 上执行阻塞 JPEG 文件写入 ---
+    private var photoWriterThread: HandlerThread? = null
+    private var photoWriterHandler: Handler? = null
 
     // --- 只在 glThread 上访问的状态 ---
     private var glThread: HandlerThread? = null
@@ -96,6 +119,10 @@ class CameraEngine(private val appContext: Context, private val listener: Listen
     /** 订阅者 ID 生成器，从 1 开始自增。0 / -1 保留作为无效值。 */
     private val idGen = AtomicInteger(1)
 
+    /** FIFO still-capture state, accessed only on cameraThread unless noted. */
+    private val pendingPhotoRequests = ArrayDeque<PhotoRequest>()
+    private var activePhotoRequest: PhotoRequest? = null
+
     /**
      * 每个订阅者对应的 GL 侧绑定。核心是 eglSurface —— 它关联了订阅者的
      * Surface，绘制后 swapBuffers 就会把画面送到对方进程。
@@ -111,6 +138,35 @@ class CameraEngine(private val appContext: Context, private val listener: Listen
         var height: Int = 0,
         @Volatile var valid: Boolean = true
     )
+
+    private class PhotoRequest(
+        val requestId: Long,
+        val subscriberId: Int,
+        val output: ParcelFileDescriptor,
+        val callback: PhotoCaptureCallback
+    ) {
+        private val finished = AtomicBoolean(false)
+
+        fun isFinished(): Boolean = finished.get()
+
+        fun succeed() {
+            if (finished.compareAndSet(false, true)) {
+                closeOutput()
+                callback.onPhotoCaptureSucceeded(requestId)
+            }
+        }
+
+        fun fail(msg: String) {
+            if (finished.compareAndSet(false, true)) {
+                closeOutput()
+                callback.onPhotoCaptureFailed(requestId, msg)
+            }
+        }
+
+        fun closeOutput() {
+            try { output.close() } catch (_: Throwable) {}
+        }
+    }
 
     // region lifecycle
 
@@ -180,11 +236,18 @@ class CameraEngine(private val appContext: Context, private val listener: Listen
     private fun closeCameraInternal() {
         opened = false
 
+        runOnCameraThreadBlocking {
+            failAllPhotoRequestsLocked("camera closed")
+        }
+
         // 1. 关相机
         try { captureSession?.close() } catch (_: Throwable) {}
         try { cameraDevice?.close() } catch (_: Throwable) {}
+        try { jpegImageReader?.close() } catch (_: Throwable) {}
         captureSession = null
         cameraDevice = null
+        jpegImageReader = null
+        jpegSurface = null
 
         // 2. 拆 GL（必须在 GL 线程做）
         runOnGlThreadBlocking {
@@ -268,6 +331,195 @@ class CameraEngine(private val appContext: Context, private val listener: Listen
 
     // endregion
 
+    // region still photo api
+
+    /**
+     * Queue one JPEG capture. The queue is owned by cameraThread so Camera2
+     * result matching stays FIFO and predictable across multiple apps.
+     */
+    fun capturePhoto(
+        requestId: Long,
+        subscriberId: Int,
+        output: ParcelFileDescriptor,
+        callback: PhotoCaptureCallback
+    ): Boolean {
+        return runOnCameraThreadBlocking {
+            if (!opened || cameraDevice == null || captureSession == null || jpegSurface == null) {
+                return@runOnCameraThreadBlocking false
+            }
+            if (pendingPhotoRequests.size >= MAX_PENDING_PHOTO_REQUESTS) {
+                return@runOnCameraThreadBlocking false
+            }
+            pendingPhotoRequests.add(PhotoRequest(requestId, subscriberId, output, callback))
+            processNextPhotoRequestLocked()
+            true
+        } ?: false
+    }
+
+    fun cancelPhotoRequest(requestId: Long, msg: String) {
+        cameraHandler?.post {
+            cancelPhotoRequestsLocked(msg) { it.requestId == requestId }
+        }
+    }
+
+    fun cancelPhotoRequestsForSubscriber(subscriberId: Int, msg: String) {
+        cameraHandler?.post {
+            cancelPhotoRequestsLocked(msg) { it.subscriberId == subscriberId }
+        }
+    }
+
+    private fun cancelPhotoRequestsLocked(msg: String, predicate: (PhotoRequest) -> Boolean) {
+        val it = pendingPhotoRequests.iterator()
+        while (it.hasNext()) {
+            val request = it.next()
+            if (predicate(request)) {
+                it.remove()
+                request.fail(msg)
+            }
+        }
+
+        activePhotoRequest?.let { request ->
+            if (predicate(request)) {
+                request.fail(msg)
+                // Keep it as active until Camera2 delivers or aborts this in-flight capture,
+                // otherwise the next queued request could accidentally consume its JPEG.
+            }
+        }
+    }
+
+    private fun failAllPhotoRequestsLocked(msg: String) {
+        while (!pendingPhotoRequests.isEmpty()) {
+            pendingPhotoRequests.removeFirst().fail(msg)
+        }
+        activePhotoRequest?.fail(msg)
+        activePhotoRequest = null
+    }
+
+    private fun processNextPhotoRequestLocked() {
+        if (activePhotoRequest != null) return
+        val session = captureSession ?: return
+        val device = cameraDevice ?: return
+        val target = jpegSurface ?: return
+
+        while (!pendingPhotoRequests.isEmpty()) {
+            val request = pendingPhotoRequests.removeFirst()
+            if (request.isFinished()) continue
+
+            activePhotoRequest = request
+            try {
+                val capture = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                    addTarget(target)
+                    set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                    set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                    set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                }
+                session.capture(capture.build(), object : CaptureCallback() {
+                    override fun onCaptureFailed(
+                        session: CameraCaptureSession,
+                        requestBuilder: CaptureRequest,
+                        failure: CaptureFailure
+                    ) {
+                        failActivePhotoRequest(request, "still capture failed: ${failure.reason}")
+                    }
+
+                    override fun onCaptureSequenceAborted(session: CameraCaptureSession, sequenceId: Int) {
+                        failActivePhotoRequest(request, "still capture aborted")
+                    }
+                }, cameraHandler)
+            } catch (t: Throwable) {
+                failActivePhotoRequest(request, t.message ?: "still capture failed")
+            }
+            return
+        }
+    }
+
+    private fun handleJpegAvailable(reader: ImageReader) {
+        val request = activePhotoRequest
+        var bytes: ByteArray? = null
+        val image = try { reader.acquireNextImage() } catch (t: Throwable) {
+            if (request != null) failActivePhotoRequest(request, t.message ?: "failed to acquire JPEG image")
+            return
+        }
+        try {
+            if (image != null && request != null && !request.isFinished()) {
+                val buffer = image.planes[0].buffer
+                bytes = ByteArray(buffer.remaining())
+                buffer.get(bytes)
+            }
+        } catch (t: Throwable) {
+            if (request != null) failActivePhotoRequest(request, t.message ?: "failed to read JPEG image")
+            return
+        } finally {
+            try { image?.close() } catch (_: Throwable) {}
+        }
+
+        if (request == null) return
+        val jpeg = bytes
+        if (request.isFinished()) {
+            completeActivePhotoRequest(request)
+            return
+        }
+        if (jpeg == null) {
+            failActivePhotoRequest(request, "JPEG image was empty")
+            return
+        }
+
+        val writer = photoWriterHandler
+        if (writer == null) {
+            failActivePhotoRequest(request, "photo writer thread is unavailable")
+            return
+        }
+        writer.post {
+            if (!request.isFinished()) {
+                try {
+                    ParcelFileDescriptor.AutoCloseOutputStream(request.output).use { out ->
+                        out.write(jpeg)
+                        out.flush()
+                    }
+                    request.succeed()
+                } catch (t: IOException) {
+                    request.fail(t.message ?: "failed to write JPEG")
+                } catch (t: Throwable) {
+                    request.fail(t.message ?: "failed to write JPEG")
+                }
+            }
+            cameraHandler?.post {
+                restorePreviewRepeatingLocked()
+                completeActivePhotoRequest(request)
+            }
+        }
+    }
+
+    private fun failActivePhotoRequest(request: PhotoRequest, msg: String) {
+        if (activePhotoRequest === request) {
+            request.fail(msg)
+            restorePreviewRepeatingLocked()
+            completeActivePhotoRequest(request)
+        }
+    }
+
+    private fun completeActivePhotoRequest(request: PhotoRequest) {
+        if (activePhotoRequest === request) {
+            activePhotoRequest = null
+            processNextPhotoRequestLocked()
+        }
+    }
+
+    private fun restorePreviewRepeatingLocked() {
+        val session = captureSession ?: return
+        val device = cameraDevice ?: return
+        val preview = cameraInputSurface ?: return
+        try {
+            val req = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            req.addTarget(preview)
+            session.setRepeatingRequest(req.build(), null, cameraHandler)
+        } catch (t: Throwable) {
+            Log.w(TAG, "restore preview repeating failed", t)
+        }
+    }
+
+    // endregion
+
     // region camera
 
     /**
@@ -287,29 +539,40 @@ class CameraEngine(private val appContext: Context, private val listener: Listen
         var success = false
 
         try {
+            val jpegSize = selectJpegSize(manager, cameraId, currentWidth, currentHeight)
+            if (jpegSize == null) {
+                listener.onEngineError(ERR_CONFIG_FAILED, "no supported JPEG output size")
+                return false
+            }
+            jpegImageReader = ImageReader.newInstance(
+                jpegSize.width,
+                jpegSize.height,
+                ImageFormat.JPEG,
+                MAX_JPEG_IMAGES
+            ).apply {
+                setOnImageAvailableListener({ reader -> handleJpegAvailable(reader) }, cameraHandler)
+            }
+            jpegSurface = jpegImageReader!!.surface
+
             @Suppress("MissingPermission")
             manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(device: CameraDevice) {
                     cameraDevice = device
                     try {
-                        // 只配置一个输出目标 —— cameraInputSurface。
-                        // 所有订阅者共享这同一个 Surface，后续通过 GL fan-out 分发。
+                        // 预览输出进 SurfaceTexture，静态照片输出进 JPEG ImageReader。
+                        // CaptureSession 不能动态追加输出，所以打开时一次性配置好。
                         device.createCaptureSession(
-                            listOf(cameraInputSurface),
+                            listOf(cameraInputSurface!!, jpegSurface!!),
                             object : CameraCaptureSession.StateCallback() {
                                 override fun onConfigured(s: CameraCaptureSession) {
                                     captureSession = s
-                                    // TEMPLATE_PREVIEW = 针对预览场景的默认参数集
-                                    val req = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-                                    req.addTarget(cameraInputSurface!!)
-                                    // setRepeatingRequest = 持续下发，直到 Session 关闭；
-                                    // 这是预览的标准做法（vs. capture = 拍一张）。
-                                    s.setRepeatingRequest(req.build(), null, cameraHandler)
+                                    restorePreviewRepeatingLocked()
                                     success = true
                                     latch.countDown()
                                 }
                                 override fun onConfigureFailed(s: CameraCaptureSession) {
                                     Log.e(TAG, "capture session config failed")
+                                    failAllPhotoRequestsLocked("capture session config failed")
                                     listener.onEngineError(ERR_CONFIG_FAILED, "capture session config failed")
                                     latch.countDown()
                                 }
@@ -318,18 +581,23 @@ class CameraEngine(private val appContext: Context, private val listener: Listen
                         )
                     } catch (t: Throwable) {
                         Log.e(TAG, "createCaptureSession threw", t)
+                        failAllPhotoRequestsLocked(t.message ?: "capture session config failed")
                         listener.onEngineError(ERR_CONFIG_FAILED, t.message ?: "unknown")
                         latch.countDown()
                     }
                 }
                 override fun onDisconnected(device: CameraDevice) {
                     // 一般是被其他进程（系统相机）抢占导致
+                    opened = false
+                    failAllPhotoRequestsLocked("camera disconnected")
                     device.close()
                     cameraDevice = null
                     listener.onCameraClosedByHal()
                     latch.countDown()
                 }
                 override fun onError(device: CameraDevice, error: Int) {
+                    opened = false
+                    failAllPhotoRequestsLocked("camera device error $error")
                     device.close()
                     cameraDevice = null
                     listener.onEngineError(ERR_DEVICE + error, "camera device error $error")
@@ -445,6 +713,10 @@ class CameraEngine(private val appContext: Context, private val listener: Listen
             glThread = HandlerThread("camera-proxy-gl").apply { start() }
             glHandler = Handler(glThread!!.looper)
         }
+        if (photoWriterThread == null) {
+            photoWriterThread = HandlerThread("camera-proxy-photo-writer").apply { start() }
+            photoWriterHandler = Handler(photoWriterThread!!.looper)
+        }
     }
 
     /** quitSafely 会等队列中的任务执行完再退出，避免任务丢失。 */
@@ -455,6 +727,9 @@ class CameraEngine(private val appContext: Context, private val listener: Listen
         glHandler = null
         glThread?.quitSafely()
         glThread = null
+        photoWriterHandler = null
+        photoWriterThread?.quitSafely()
+        photoWriterThread = null
     }
 
     /**
@@ -473,7 +748,41 @@ class CameraEngine(private val appContext: Context, private val listener: Listen
         latch.await()
     }
 
+    private fun <T> runOnCameraThreadBlocking(block: () -> T): T? {
+        val h = cameraHandler ?: return null
+        if (Thread.currentThread() === cameraThread) return block()
+        val latch = java.util.concurrent.CountDownLatch(1)
+        var result: T? = null
+        h.post {
+            try { result = block() } finally { latch.countDown() }
+        }
+        latch.await()
+        return result
+    }
+
     // endregion
+
+    private fun selectJpegSize(
+        manager: CameraManager,
+        cameraId: String,
+        previewWidth: Int,
+        previewHeight: Int
+    ): Size? {
+        val chars = try { manager.getCameraCharacteristics(cameraId) } catch (_: Throwable) { return null }
+        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return null
+        val sizes = map.getOutputSizes(ImageFormat.JPEG)?.toList().orEmpty()
+        if (sizes.isEmpty()) return null
+
+        val previewRatio = previewWidth.toFloat() / previewHeight.coerceAtLeast(1)
+        val ratioMatched = sizes.filter { size ->
+            abs((size.width.toFloat() / size.height.coerceAtLeast(1)) - previewRatio) < 0.02f
+        }
+        val candidates = (ratioMatched.ifEmpty { sizes })
+            .filter { it.width.toLong() * it.height <= MAX_JPEG_CAPTURE_AREA }
+            .ifEmpty { ratioMatched.ifEmpty { sizes } }
+
+        return candidates.maxByOrNull { it.width.toLong() * it.height }
+    }
 
     /**
      * 查询相机静态能力（供 Client 通过 getCapabilities AIDL 调用）。
@@ -501,6 +810,9 @@ class CameraEngine(private val appContext: Context, private val listener: Listen
 
     companion object {
         private const val TAG = "CameraEngine"
+        private const val MAX_PENDING_PHOTO_REQUESTS = 8
+        private const val MAX_JPEG_IMAGES = 2
+        private const val MAX_JPEG_CAPTURE_AREA = 1920L * 1080L
         /** CaptureSession 配置失败（比如 Surface 组合不被硬件支持）。 */
         const val ERR_CONFIG_FAILED = 100
         /** openCamera 抛异常（比如没权限）。 */

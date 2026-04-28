@@ -11,13 +11,16 @@ import android.content.pm.ServiceInfo
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import android.os.ParcelFileDescriptor
 import android.util.Log
 import android.view.Surface
 import androidx.core.content.ContextCompat
 import com.example.cameraproxy.CameraCapabilities
 import com.example.cameraproxy.ICameraCallback
 import com.example.cameraproxy.ICameraProxyService
+import com.example.cameraproxy.IPhotoCaptureCallback
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -54,6 +57,9 @@ class CameraHolderService : Service() {
      */
     private val records = ConcurrentHashMap<Int, SubscriberRecord>()
 
+    private val photoRequestIds = AtomicLong(1L)
+    private val photoRequests = ConcurrentHashMap<Long, PendingPhotoRequest>()
+
     /**
      * 【脚手架字段 —— 当前未真正发挥作用】
      *
@@ -88,6 +94,13 @@ class CameraHolderService : Service() {
         val deathRecipient: IBinder.DeathRecipient
     )
 
+    private class PendingPhotoRequest(
+        val requestId: Long,
+        val subscriberId: Int,
+        val callback: IPhotoCaptureCallback,
+        val deathRecipient: IBinder.DeathRecipient?
+    )
+
     /**
      * 从 CameraEngine 收到的事件 → 广播给所有订阅者。
      * safeCall 包一层是为了某个 Client 挂掉时自动清理它，不影响其他人。
@@ -118,6 +131,9 @@ class CameraHolderService : Service() {
 
     override fun onDestroy() {
         // Service 即将销毁，主动通知所有订阅者 + 关相机
+        photoRequests.keys.toList().forEach { requestId ->
+            engine.cancelPhotoRequest(requestId, "service destroyed")
+        }
         records.values.toList().forEach { unlinkAndForget(it) }
         records.clear()
         engine.closeCamera()
@@ -182,6 +198,56 @@ class CameraHolderService : Service() {
             internalUnsubscribe(subscriberId)
         }
 
+        override fun capturePhoto(
+            subscriberId: Int,
+            output: ParcelFileDescriptor?,
+            callback: IPhotoCaptureCallback?
+        ): Long {
+            if (!records.containsKey(subscriberId) || output == null || callback == null) {
+                try { output?.close() } catch (_: Throwable) {}
+                return -1L
+            }
+            requireCameraPermission()
+
+            val requestId = photoRequestIds.getAndIncrement()
+            val deathRecipient = IBinder.DeathRecipient {
+                Log.w(TAG, "photo callback died, cancelling request=$requestId subscriber=$subscriberId")
+                photoRequests.remove(requestId)?.let { unlinkPhotoCallback(it) }
+                engine.cancelPhotoRequest(requestId, "photo callback binder died")
+            }
+            try {
+                callback.asBinder().linkToDeath(deathRecipient, 0)
+            } catch (t: Throwable) {
+                Log.e(TAG, "photo callback linkToDeath failed", t)
+                try { output.close() } catch (_: Throwable) {}
+                return -1L
+            }
+
+            val pending = PendingPhotoRequest(requestId, subscriberId, callback, deathRecipient)
+            photoRequests[requestId] = pending
+            val accepted = engine.capturePhoto(
+                requestId,
+                subscriberId,
+                output,
+                object : CameraEngine.PhotoCaptureCallback {
+                    override fun onPhotoCaptureSucceeded(requestId: Long) {
+                        completePhotoRequest(requestId, null)
+                    }
+
+                    override fun onPhotoCaptureFailed(requestId: Long, msg: String) {
+                        completePhotoRequest(requestId, msg)
+                    }
+                }
+            )
+            if (!accepted) {
+                photoRequests.remove(requestId)
+                unlinkPhotoCallback(pending)
+                try { output.close() } catch (_: Throwable) {}
+                return -1L
+            }
+            return requestId
+        }
+
         override fun getCapabilities(cameraId: String?): CameraCapabilities? {
             if (cameraId == null) return null
             return engine.buildCapabilities(cameraId)
@@ -229,6 +295,7 @@ class CameraHolderService : Service() {
     private fun internalUnsubscribe(id: Int) {
         val r = records.remove(id) ?: return
         unlinkAndForget(r)
+        engine.cancelPhotoRequestsForSubscriber(id, "subscriber unsubscribed")
         engine.removeSubscriber(id)
         controlOwner.compareAndSet(id, null)
         if (records.isEmpty()) {
@@ -240,6 +307,25 @@ class CameraHolderService : Service() {
     /** 解除死亡监听。Binder 已死时 unlinkToDeath 会抛异常，吞掉即可。 */
     private fun unlinkAndForget(r: SubscriberRecord) {
         try { r.callback.asBinder().unlinkToDeath(r.deathRecipient, 0) } catch (_: Throwable) {}
+    }
+
+    private fun completePhotoRequest(requestId: Long, failureMsg: String?) {
+        val request = photoRequests.remove(requestId) ?: return
+        unlinkPhotoCallback(request)
+        try {
+            if (failureMsg == null) {
+                request.callback.onPhotoCaptureSucceeded(requestId)
+            } else {
+                request.callback.onPhotoCaptureFailed(requestId, failureMsg)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "photo callback failed for request=$requestId", t)
+        }
+    }
+
+    private fun unlinkPhotoCallback(request: PendingPhotoRequest) {
+        val deathRecipient = request.deathRecipient ?: return
+        try { request.callback.asBinder().unlinkToDeath(deathRecipient, 0) } catch (_: Throwable) {}
     }
 
     /**
