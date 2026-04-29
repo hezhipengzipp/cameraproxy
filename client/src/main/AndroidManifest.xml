@@ -9,6 +9,7 @@
     </queries>
 
     <application
+        android:name=".MyApplication"
         android:label="CameraProxy Client"
         android:allowBackup="false"
         android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
