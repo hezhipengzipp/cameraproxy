@@ -1,29 +1,27 @@
-platform :android do
+default_platform(:android)
 
-  desc "构建 Beta 版本 APK（client + server）"
-  lane :beta do
-    # 签名配置：优先使用环境变量，否则使用 debug keystore
-    keystore_path = ENV["KEYSTORE_PATH"] || File.join(Dir.home, ".android", "debug.keystore")
-    keystore_password = ENV["KEYSTORE_PASSWORD"] || "android"
-    key_alias = ENV["KEY_ALIAS"] || "androiddebugkey"
-    key_password = ENV["KEY_PASSWORD"] || "android"
+desc "构建 Beta 版本 APK（client + server）"
+lane :beta do
+  # 签名配置：优先使用环境变量，否则使用 debug keystore
+  keystore_path = ENV["KEYSTORE_PATH"] || File.join(Dir.home, ".android", "debug.keystore")
+  keystore_password = ENV["KEYSTORE_PASSWORD"] || "android"
+  key_alias = ENV["KEY_ALIAS"] || "androiddebugkey"
+  key_password = ENV["KEY_PASSWORD"] || "android"
 
-    gradle(task: "clean", project_dir: ".")
+  gradle(task: "clean", project_dir: ".")
 
-    gradle(
-      task: "assembleRelease",
-      project_dir: ".",
-      properties: {
-        "android.injected.signing.store.file" => keystore_path,
-        "android.injected.signing.store.password" => keystore_password,
-        "android.injected.signing.key.alias" => key_alias,
-        "android.injected.signing.key.password" => key_password,
-      }
-    )
+  gradle(
+    task: "assembleRelease",
+    project_dir: ".",
+    properties: {
+      "android.injected.signing.store.file" => keystore_path,
+      "android.injected.signing.store.password" => keystore_password,
+      "android.injected.signing.key.alias" => key_alias,
+      "android.injected.signing.key.password" => key_password,
+    }
+  )
 
-    artifacts = Dir.glob("**/build/outputs/apk/release/*.apk")
-    UI.success "生成了 #{artifacts.size} 个 APK:"
-    artifacts.each { |apk| UI.message "  #{apk}" }
-  end
-
+  artifacts = Dir.glob("**/build/outputs/apk/release/*.apk")
+  UI.success "生成了 #{artifacts.size} 个 APK:"
+  artifacts.each { |apk| UI.message "  #{apk}" }
 end
