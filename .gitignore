@@ -16,3 +16,7 @@ fastlane/README.md
 Gemfile.lock
 vendor/bundle/
 .bundle/
+
+# Keystore
+*.jks
+*.keystore

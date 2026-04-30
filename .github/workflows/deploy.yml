@@ -44,7 +44,12 @@ jobs:
           fi
 
       - name: Run Fastlane beta
-        run: bundle exec fastlane beta
+        run: |
+          export SIGNING_STORE_FILE="${SIGNING_STORE_FILE:-$HOME/.android/debug.keystore}"
+          export SIGNING_STORE_PASSWORD="${SIGNING_STORE_PASSWORD:-android}"
+          export SIGNING_KEY_ALIAS="${SIGNING_KEY_ALIAS:-androiddebugkey}"
+          export SIGNING_KEY_PASSWORD="${SIGNING_KEY_PASSWORD:-android}"
+          bundle exec fastlane beta
 
       - name: Upload APKs
         if: always()
