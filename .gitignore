@@ -7,3 +7,12 @@ local.properties
 captures/
 .externalNativeBuild/
 .cxx/
+
+# Fastlane
+fastlane/report.xml
+fastlane/README.md
+
+# Gem
+Gemfile.lock
+vendor/bundle/
+.bundle/

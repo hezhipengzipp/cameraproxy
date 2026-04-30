@@ -1,0 +1,11 @@
+# CameraProxy Client
+for_lane :client do
+  json_key_file "" # 暂不上传 Google Play，留空
+  package_name "com.example.cameraproxy.client"
+end
+
+# CameraProxy Server
+for_lane :server do
+  json_key_file "" # 暂不上传 Google Play，留空
+  package_name "com.example.cameraproxy.server"
+end
