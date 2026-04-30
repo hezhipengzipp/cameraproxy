@@ -1,4 +1,59 @@
+require "json"
+require "net/http"
+require "uri"
+
 default_platform(:android)
+
+def pgyer_install_url(data)
+  shortcut = data["buildShortcutUrl"].to_s
+  return shortcut if shortcut.start_with?("http://", "https://")
+  return "https://www.pgyer.com/#{shortcut}" unless shortcut.empty?
+
+  data["buildQRCodeURL"].to_s
+end
+
+def upload_to_pgyer(apk)
+  api_key = ENV["PGYER_API_KEY"].to_s.strip
+  if api_key.empty?
+    message = "未配置 PGYER_API_KEY，跳过蒲公英上传"
+    ENV["PGYER_UPLOAD_REQUIRED"] == "true" ? UI.user_error!(message) : UI.important(message)
+    return
+  end
+
+  file = File.open(apk, "rb")
+  uri = URI("https://api.pgyer.com/apiv2/app/upload")
+  request = Net::HTTP::Post.new(uri)
+  install_type = ENV["PGYER_INSTALL_TYPE"].to_s.strip
+  install_type = "1" if install_type.empty?
+
+  form = [
+    ["_api_key", api_key],
+    ["file", file],
+    ["buildInstallType", install_type]
+  ]
+
+  password = ENV["PGYER_PASSWORD"].to_s
+  form << ["buildPassword", password] unless password.empty?
+
+  description = ENV["PGYER_UPDATE_DESCRIPTION"].to_s
+  description = "GitHub Actions #{ENV["GITHUB_SHA"][0, 7]}" if description.empty? && ENV["GITHUB_SHA"]
+  form << ["buildUpdateDescription", description] unless description.empty?
+
+  request.set_form(form, "multipart/form-data")
+  response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(request) }
+  body = response.body.to_s
+  json = JSON.parse(body)
+
+  unless response.is_a?(Net::HTTPSuccess) && json["code"].to_i == 0
+    UI.user_error!("蒲公英上传失败 #{response.code}: #{body}")
+  end
+
+  data = json["data"] || {}
+  UI.success "蒲公英上传成功: #{apk}"
+  UI.message "  #{pgyer_install_url(data)}"
+ensure
+  file&.close
+end
 
 desc "构建 Beta 版本 APK（client + server）"
 lane :beta do
@@ -20,4 +75,6 @@ lane :beta do
   artifacts = Dir.glob("**/build/outputs/apk/release/*.apk")
   UI.success "生成了 #{artifacts.size} 个 APK:"
   artifacts.each { |apk| UI.message "  #{apk}" }
+
+  artifacts.each { |apk| upload_to_pgyer(apk) }
 end

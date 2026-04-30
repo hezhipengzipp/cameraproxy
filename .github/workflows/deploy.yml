@@ -44,6 +44,12 @@ jobs:
           fi
 
       - name: Run Fastlane beta
+        env:
+          PGYER_API_KEY: ${{ secrets.PGYER_API_KEY }}
+          PGYER_PASSWORD: ${{ secrets.PGYER_PASSWORD }}
+          PGYER_INSTALL_TYPE: ${{ vars.PGYER_INSTALL_TYPE }}
+          PGYER_UPDATE_DESCRIPTION: ${{ github.event.head_commit.message }}
+          PGYER_UPLOAD_REQUIRED: 'true'
         run: |
           export SIGNING_STORE_FILE="${SIGNING_STORE_FILE:-$HOME/.android/debug.keystore}"
           export SIGNING_STORE_PASSWORD="${SIGNING_STORE_PASSWORD:-android}"
