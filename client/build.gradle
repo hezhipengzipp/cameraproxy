@@ -15,6 +15,20 @@ android {
         versionName "1.0"
     }
 
+    signingConfigs {
+        release {
+            storeFile file(project.findProperty('SIGNING_STORE_FILE') ?: rootProject.file('camera.jks'))
+            storePassword project.findProperty('SIGNING_STORE_PASSWORD') ?: 'hello666'
+            keyAlias project.findProperty('SIGNING_KEY_ALIAS') ?: 'zippsun'
+            keyPassword project.findProperty('SIGNING_KEY_PASSWORD') ?: 'hello666'
+        }
+    }
+    buildTypes {
+        release {
+            signingConfig signingConfigs.release
+        }
+    }
+
     buildFeatures {
         aidl true
         viewBinding true
