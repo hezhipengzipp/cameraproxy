@@ -55,6 +55,10 @@ ensure
   file&.close
 end
 
+def relative_path(path)
+  path.sub("#{File.expand_path('..', __dir__)}/", "")
+end
+
 desc "构建 Beta 版本 APK（client + server）"
 lane :beta do
   gradle(task: "clean", project_dir: ".")
@@ -72,9 +76,16 @@ lane :beta do
     properties: properties
   )
 
-  artifacts = Dir.glob("**/build/outputs/apk/release/*.apk")
+  repo_root = File.expand_path("..", __dir__)
+  artifacts = [
+    File.join(repo_root, "client/build/outputs/apk/release/*.apk"),
+    File.join(repo_root, "server/build/outputs/apk/release/*.apk")
+  ].flat_map { |pattern| Dir.glob(pattern) }.sort
+
+  UI.user_error!("未找到 release APK，请检查 Gradle 输出路径") if artifacts.empty?
+
   UI.success "生成了 #{artifacts.size} 个 APK:"
-  artifacts.each { |apk| UI.message "  #{apk}" }
+  artifacts.each { |apk| UI.message "  #{relative_path(apk)}" }
 
   artifacts.each { |apk| upload_to_pgyer(apk) }
 end
